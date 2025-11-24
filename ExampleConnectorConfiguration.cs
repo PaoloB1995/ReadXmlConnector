@@ -18,11 +18,12 @@ namespace ReadXmlConnector
      */
     public class ExampleConnectorConfiguration : AbstractConnectorConfig
     {
-        [Property("Path to monitor", "Monitor all files in this path (remember trailing slash)")]
-        public string PathToMonitor { get; set; }
 
         [Property("Connection String", "Connection String to the database")]
         public string ConnectionString { get; set; }
+
+        [Property("Path to monitor", "Monitor all files in this path (remember trailing slash)")]
+        public string PathToMonitor { get; set; }
 
         [Property("Output Path", "Folder in which file is moved after the process")]
         public string OutputPath { get; set; }

@@ -12,5 +12,6 @@ namespace ReadXmlConnector
     {
         [Property("FileFullPath", "Full path of generated file")]
         public string FileFullPath { get; set; }
+
     }
 }

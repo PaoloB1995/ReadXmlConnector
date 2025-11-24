@@ -15,6 +15,8 @@ using System.Threading.Tasks;
 using System.Xml.Linq;
 using ReadXmlConnector.Services;
 using System.Linq;
+using Sedapta.Configuration.Client;
+using Sedapta.Configuration.Primitives.Models;
 
 namespace ReadXmlConnector
 {
@@ -160,84 +162,123 @@ namespace ReadXmlConnector
 
         private async void EventRaised(object sender, System.IO.FileSystemEventArgs e)
         {
+            logger.Info("Started monitoring folder ");
+
             string xmlFilePath = e.FullPath;
 
             XDocument xmlDoc = XDocument.Load(xmlFilePath);
+
+            // Recupero i dati dalla General Statistic
+
+            var general = xmlDoc
+                .Root
+                .Element("GeneralStatistics")
+                .Element("GeneralStatistic");
+
+            // Converte gli attributi in decimal
+            decimal area = ParseDecimal((string)general.Attribute("Area"));
+            decimal partsPerc = ParseDecimal((string)general.Attribute("PartsPerc"));
+            decimal scrapPerc = ParseDecimal((string)general.Attribute("ScrapPerc"));
+            decimal remnantPerc = ParseDecimal((string)general.Attribute("RemnantPerc"));
+
+            List<string> distinctOrders = new List<string>();
 
             // --- 1. Recupero tutti i pattern ---
             var patterns = xmlDoc.Root?.Element("Patterns")?.Elements("Pattern").ToList();
 
             if (patterns == null || patterns.Count == 0)
             {
-                Console.WriteLine("Nessun pattern trovato nel file XML");
+                logger.Debug("Nessun pattern trovato nel file XML");
                 return;
             }
 
-            Console.WriteLine($"Trovati {patterns.Count} pattern.");
+            logger.Debug($"Trovati {patterns.Count} pattern.");
+
+            var product = "NeConnector";
+            var instance = "DEFAULT";
+
+            var cs = ConfigurationFactory.Create(product, instance);
+            var databaseMOM = cs.GetPropertyByUniqueName<Database>("supplychain.core.nicimdatabase.config+NicimDatabase", instance);
+
 
             foreach (var pattern in patterns)
             {
                 string name = pattern.Attribute("Name")?.Value ?? "";
-                decimal area = ParseDecimal(pattern.Attribute("Area")?.Value);
-                decimal partsPerc = ParseDecimal(pattern.Attribute("PartsPerc")?.Value);
-                decimal scrapPerc = ParseDecimal(pattern.Attribute("ScrapPerc")?.Value);
-                decimal remnantPerc = ParseDecimal(pattern.Attribute("RemnantPerc")?.Value);
 
-                Console.WriteLine($"\n--- Elaboro pattern: {name} ---");
-                Console.WriteLine($"Area={area}, Parts%={partsPerc}, Scrap%={scrapPerc}, Remnant%={remnantPerc}");
+                // Ciclo su tutte le Part dentro questo Pattern
+                var patternParts = pattern.Element("Parts")?.Elements("Part");
 
-
-                // --- 2. Ricavo ordini dal DB per il pattern ---
-                List<string> workOrders = await ProcessDatabaseOperations(configuration.ConnectionString, name);
-
-                if (workOrders.Count == 0)
+                if (patternParts != null)
                 {
-                    Console.WriteLine($"Nessun ordine trovato per il pattern {name}");
-                    continue;
+                    foreach (var part in patternParts)
+                    {
+                        string serial = part.Attribute("Code")?.Value ?? "";
+
+                        logger.Debug($"Seriale {serial} trovato.");
+
+                        bool res = await AddAssociation(configuration.ConnectionString, serial, name);
+
+                        List<string> Orders = await RetrieveOrders(configuration.ConnectionString, serial);
+
+                        // 3️⃣ Aggiungi alla lista globale solo i valori distinti
+                        foreach (var wo in Orders)
+                        {
+                            if (!distinctOrders.Contains(wo))
+                                distinctOrders.Add(wo);
+                        }
+
+                    }
                 }
 
+            }
+
+
+            if (distinctOrders.Count == 0)
+            {
+                logger.Debug($"Nessun ordine trovato per i seriali processati");
+            }
+            else
+            {
                 // --- 3. Calcoli ---
-                decimal areaPerOrder = area / workOrders.Count;
+                decimal areaPerOrder = area / distinctOrders.Count;
                 decimal partsArea = areaPerOrder * (partsPerc / 100);
                 decimal scrapArea = areaPerOrder * (scrapPerc / 100);
                 decimal remnantArea = areaPerOrder * (remnantPerc / 100);
                 decimal quantity = partsArea + scrapArea + remnantArea;
 
-                Console.WriteLine($"Ordini trovati: {workOrders.Count}, area per ordine={areaPerOrder}");
-                Console.WriteLine($"PartsArea={partsArea}, ScrapArea={scrapArea}, RemnantArea={remnantArea}");
+                logger.Debug($"Ordini trovati: {distinctOrders.Count}, area per ordine={areaPerOrder}");
+                logger.Debug($"PartsArea={partsArea}, ScrapArea={scrapArea}, RemnantArea={remnantArea}");
 
                 // --- 4. Aggiorna la tabella movimenti ---
-                await UpdateDatabaseOperations("Server=DELSQL02\\delsql;Database=demo-sbonucelliscm-nicim_scm-dev;TrustServerCertificate=true;User Id=user_demo-sbonucelliscm-nicim_scm-dev;Password=123Stella$;", workOrders, quantity, scrapArea, remnantArea);
+                await UpdateDatabaseOperations(configuration.ConnectionString, distinctOrders, quantity, scrapArea, remnantArea);
 
-                Console.WriteLine($"Aggiornamento completato per il pattern {name}");
-
-                try
-                {
-                    string outputFolder = configuration.OutputPath;
-                    Directory.CreateDirectory(outputFolder); // si assicura che la cartella esista
-
-                    string destinationFilePath = Path.Combine(outputFolder, Path.GetFileName(xmlFilePath));
-
-                    // Se il file esiste già nella cartella di destinazione, aggiunge un timestamp per evitare conflitti
-                    if (File.Exists(destinationFilePath))
-                    {
-                        string fileNameWithoutExt = Path.GetFileNameWithoutExtension(xmlFilePath);
-                        string ext = Path.GetExtension(xmlFilePath);
-                        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                        destinationFilePath = Path.Combine(outputFolder, $"{fileNameWithoutExt}_{timestamp}{ext}");
-                    }
-
-                    File.Move(xmlFilePath, destinationFilePath);
-                    Console.WriteLine($"File spostato in: {destinationFilePath}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Errore durante lo spostamento del file: {ex.Message}");
-                }
             }
 
-            Console.WriteLine("\nElaborazione completata con successo!");
+            try
+            {
+                string outputFolder = configuration.OutputPath;
+                System.IO.Directory.CreateDirectory(outputFolder); // si assicura che la cartella esista
 
+                string destinationFilePath = Path.Combine(outputFolder, Path.GetFileName(xmlFilePath));
+
+                // Se il file esiste già nella cartella di destinazione, aggiunge un timestamp per evitare conflitti
+                if (File.Exists(destinationFilePath))
+                {
+                    string fileNameWithoutExt = Path.GetFileNameWithoutExtension(xmlFilePath);
+                    string ext = Path.GetExtension(xmlFilePath);
+                    string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                    destinationFilePath = Path.Combine(outputFolder, $"{fileNameWithoutExt}_{timestamp}{ext}");
+                }
+
+                File.Move(xmlFilePath, destinationFilePath);
+                logger.Debug($"File spostato in: {destinationFilePath}");
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"Errore durante lo spostamento del file: {ex.Message}");
+            }
+            
+             logger.Debug("\nElaborazione completata con successo!");
         }
 
         // --- FUNZIONI DI SUPPORTO ---
@@ -248,7 +289,7 @@ namespace ReadXmlConnector
         /**
          * Seleziona gli ordini associati a un pattern
          */
-        static async Task<List<string>> ProcessDatabaseOperations(string connectionString, string patternName)
+        static async Task<List<string>> RetrieveOrders(string connectionString, string serial)
         {
             List<string> result = new List<string>();
             try
@@ -258,14 +299,14 @@ namespace ReadXmlConnector
 
                     await connection.OpenAsync();
 
-                    string commandText = QueryService.SelectWorkOrders.Replace("@pattern_name", $"'{patternName}'");
+                    string commandText = QueryService.SelectWorkOrders.Replace("@serial", $"'{serial}'");
 
                     using (SqlCommand getWOs = new SqlCommand(commandText, connection))
                     {
 
                         getWOs.CommandType = CommandType.Text;
 
-                        Console.WriteLine($"Eseguo query WorkOrders per pattern: {patternName}");
+                        logger.Debug($"Eseguo query WorkOrders per seruale: {serial}");
                         SqlDataReader reader = await getWOs.ExecuteReaderAsync();
 
                         while (reader.Read())
@@ -275,20 +316,99 @@ namespace ReadXmlConnector
                                 result.Add(workOrder);
                         }
                     }
-
-
                 }
-
-
 
                 return result;
             }
             catch (SqlException ex)
             {
-                Console.WriteLine($"Errore DB (ProcessDatabaseOperations): {ex.Message}");
+                logger.Error($"Errore DB (ProcessDatabaseOperations): {ex.Message}");
                 throw;
             }
         }
+
+
+        static async Task<bool> AddAssociation(string connectionString, string serial, string prjName)
+        {
+            List<string> result = new List<string>();
+
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    await connection.OpenAsync();
+
+                    using (SqlCommand checkAssociation = new SqlCommand(QueryService.CheckAssociation, connection))
+                    {
+                        checkAssociation.CommandType = CommandType.Text;
+
+                        // Aggiungi il parametro @serial
+                        checkAssociation.Parameters.Add("@serial", SqlDbType.VarChar).Value = serial;
+
+                        // Esegui la query (di solito ExecuteScalar va benissimo)
+                        object queryResult = await checkAssociation.ExecuteScalarAsync();
+
+                        if (queryResult == null || queryResult == DBNull.Value)
+                        {
+                            // ------------------------------------------------------
+                            // 2️⃣ NON ESISTE → esegui INSERT
+                            // ------------------------------------------------------
+                            logger.Debug($"Nessun record per {serial}. Eseguo INSERT...");
+
+                            using (SqlCommand insertCmd = new SqlCommand(QueryService.InsertAssociation, connection))
+                            {
+                                insertCmd.CommandType = CommandType.Text;
+
+                                insertCmd.Parameters.Add("@project", SqlDbType.VarChar).Value = prjName;
+                                insertCmd.Parameters.Add("@serial", SqlDbType.VarChar).Value = serial;
+
+                                int insertResult = await insertCmd.ExecuteNonQueryAsync();
+
+                                if (insertResult > 0)
+                                    result.Add($"INSERTED: {serial}");
+                                else
+                                    result.Add($"INSERT_FAILED: {serial}");
+                            }
+
+                            return true;
+                        }
+                        else
+                        {
+                            // ------------------------------------------------------
+                            // 3️⃣ ESISTE → esegui UPDATE
+                            // ------------------------------------------------------
+                            logger.Debug($"Record già esistente per {serial}. Eseguo UPDATE...");
+
+                            using (SqlCommand updateCmd = new SqlCommand(QueryService.UpdateAssociation, connection))
+                            {
+                                updateCmd.CommandType = CommandType.Text;
+
+                                updateCmd.Parameters.Add("@project", SqlDbType.VarChar).Value = prjName;
+                                updateCmd.Parameters.Add("@serial", SqlDbType.VarChar).Value = serial;
+
+                                int updateResult = await updateCmd.ExecuteNonQueryAsync();
+
+                                if (updateResult > 0)
+                                    result.Add($"UPDATED: {serial}");
+                                else
+                                    result.Add($"UPDATE_FAILED: {serial}");
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+            catch (SqlException ex)
+            {
+                logger.Error($"Errore DB (AddAssociation): {ex.Message}");
+                throw;
+            }
+        }
+
+
+
+
+
 
         /**
          * Aggiorna la tabella movimenti con i valori calcolati
@@ -318,7 +438,7 @@ namespace ReadXmlConnector
                         updateMovimenti.Parameters.Add("remnantPerc", SqlDbType.Decimal).Value = remnantArea;
 
                         int rowsAffected = await updateMovimenti.ExecuteNonQueryAsync();
-                        Console.WriteLine($"Aggiornati {rowsAffected} record nella tabella movimenti per gli ordini: {ordini}");
+                        logger.Debug($"Aggiornati {rowsAffected} record nella tabella movimenti per gli ordini: {ordini}");
                     }
 
                 }
@@ -326,7 +446,7 @@ namespace ReadXmlConnector
             }
             catch (SqlException ex)
             {
-                Console.WriteLine($"Errore DB (UpdateDatabaseOperations): {ex.Message}");
+                logger.Error($"Errore DB (UpdateDatabaseOperations): {ex.Message}");
                 throw;
             }
         }

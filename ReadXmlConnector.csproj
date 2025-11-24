@@ -32,6 +32,15 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="Sedapta.Configuration.AppConfiguration.AspNet">
+      <HintPath>..\..\..\..\Downloads\bin\bin\Sedapta.Configuration.AppConfiguration.AspNet.dll</HintPath>
+    </Reference>
+    <Reference Include="Sedapta.Configuration.Client">
+      <HintPath>..\..\..\..\Downloads\bin\bin\Sedapta.Configuration.Client.dll</HintPath>
+    </Reference>
+    <Reference Include="Sedapta.Configuration.Primitives">
+      <HintPath>..\..\..\..\Downloads\bin\bin\Sedapta.Configuration.Primitives.dll</HintPath>
+    </Reference>
     <Reference Include="SedApta.NotificationEngine.Interfaces">
       <HintPath>..\..\..\..\Downloads\bin\bin\SedApta.NotificationEngine.Interfaces.dll</HintPath>
     </Reference>

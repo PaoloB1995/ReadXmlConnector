@@ -21,5 +21,6 @@ namespace ReadXmlConnector
     {
         [Property("FileNameFilter", "File name filter")]
         public string FileNameFilter { get; set; }
+
     }
 }
