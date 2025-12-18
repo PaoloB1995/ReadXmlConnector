@@ -7,7 +7,7 @@ namespace ReadXmlConnector.Services
     public static class QueryService
     {
 
-        public static string SelectWorkOrders = "SELECT DISTINCT WorkOrder FROM SCM_B2B_SERIAL_NUMBER WITH(NOLOCK) where SerialNumber = @serial";
+        public static string SelectWorkOrders = "SELECT DISTINCT WorkOrder FROM SCM_SERIAL_NUMBER WITH(NOLOCK) where SerialNumber = @serial";
 
         public static string UpdateMovements = "UPDATE movimenti\r\nSET quantita = @quantity, coeff_sfrido = @scrapPerc, um_sfrido=0, custom_1 = @remnantPerc\r\nWHERE codice_ordine IN (@orders) AND codice_fase = 10";
 
