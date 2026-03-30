@@ -7,9 +7,9 @@ namespace ReadXmlConnector.Services
     public static class QueryService
     {
 
-        public static string SelectWorkOrders = "SELECT DISTINCT WorkOrder FROM SCM_SERIAL_NUMBER WITH(NOLOCK) where SerialNumber = @serial";
+        public static string SelectWorkOrders = "SELECT top(1) WorkOrder FROM SCM_SERIAL_NUMBER WITH(NOLOCK) where SerialNumber = @serial";
 
-        public static string UpdateMovements = "UPDATE movimenti\r\nSET quantita = @quantity, coeff_sfrido = @scrapPerc, um_sfrido=0, custom_1 = @remnantPerc\r\nWHERE codice_ordine IN (@orders) AND codice_fase = 10";
+        public static string InsertConsumption = "INSERT INTO SCM_CONSUMPTION(WorkOrder, Operation, MaterialCode, RemnantCode, ConsumptionGood, ConsumptionScrap, ConsumptionRemnant, ProgramName, CrDate) VALUES(@order, 10, @material, @remnantcode, @good, @scrap, @remnant, @prgName, SYSDATETIME())";
 
         public static string InsertAssociation = "INSERT INTO SCM_PROJECT_COMPONENT(PROJECT_ID, COMPONENT_SERIAL_NUMBER, FLAG01) VALUES(@project, @serial, 0)";
 

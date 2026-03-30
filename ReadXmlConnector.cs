@@ -1,4 +1,7 @@
-﻿using SedApta.NotificationEngine.Interfaces;
+﻿using ReadXmlConnector.Services;
+using Sedapta.Configuration.Client;
+using Sedapta.Configuration.Primitives.Models;
+using SedApta.NotificationEngine.Interfaces;
 using SedApta.NotificationEngine.Interfaces.Connector;
 using SedApta.NotificationEngine.Interfaces.Connector.Delegate;
 using SedApta.NotificationEngine.Interfaces.Data;
@@ -6,17 +9,16 @@ using SedApta.NotificationEngine.Interfaces.Message;
 using SedApta.NotificationEngine.Interfaces.Utils.ConnectorAttributes;
 using System;
 using System.Collections.Generic;
-using System.Data.SqlClient;
 using System.Data;
+using System.Data.SqlClient;
+using System.Data.SqlTypes;
 using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
-using ReadXmlConnector.Services;
-using System.Linq;
-using Sedapta.Configuration.Client;
-using Sedapta.Configuration.Primitives.Models;
 
 namespace ReadXmlConnector
 {
@@ -43,14 +45,31 @@ namespace ReadXmlConnector
         private static readonly ILogger logger = LoggerFactory.GetLogger(System.Reflection.MethodBase.GetCurrentMethod().DeclaringType);
 
         private Dictionary<string, List<StartListenerInput<ExampleConnectorInputConfiguration>>> watchedFiles = new Dictionary<string, List<StartListenerInput<ExampleConnectorInputConfiguration>>>();
+        private List<StartListenerInput<ExampleConnectorInputConfiguration>> _startListenerInput;
         private FileSystemWatcher watchFolder = null;
+        private NetworkConnection networkConnection = null;
+        Timer scmMachineScanTimer;
 
         public ReadXmlConnector(ExampleConnectorConfiguration configuration, GlobalConfiguration globalConfiguration) : base(configuration, globalConfiguration) { }
 
         public override void Dispose()
         {
             logger.Trace("ExampleConnector " + configuration.InstanceName + "stopped listening for events.");
-            if (watchFolder != null) watchFolder.Dispose();
+
+            scmMachineScanTimer?.Dispose();
+            scmMachineScanTimer = null;
+
+            if (watchFolder != null)
+            {
+                watchFolder.Dispose();
+                watchFolder = null;
+            }
+
+            if (networkConnection != null)
+            {
+                networkConnection.Dispose();
+                networkConnection = null;
+            }
         }
 
         /*
@@ -80,8 +99,113 @@ namespace ReadXmlConnector
                     watchedFiles[eventConfiguration.FileNameFilter].Add(item);
                 }
             }
-            StartActivityMonitoring(configuration.PathToMonitor);
+
+            // Avvia subito il primo tentativo, poi ogni N minuti se non connesso
+            scmMachineScanTimer = new Timer(TryConnectAndMonitor, null, TimeSpan.Zero, TimeSpan.FromMinutes(configuration.MintutesRetry));
+
         }
+
+
+        private void TryConnectAndMonitor(object state)
+        {
+            // Se il watcher è già attivo, non fare nulla
+            if (watchFolder != null && watchFolder.EnableRaisingEvents)
+            {
+                logger.Trace("Monitoring già attivo, skip.");
+                return;
+            }
+
+            logger.Info("Tentativo di connessione alla risorsa di rete...");
+
+            // Pulisce eventuale connessione precedente fallita
+            if (networkConnection != null)
+            {
+                networkConnection.Dispose();
+                networkConnection = null;
+            }
+
+            bool connected = ConnectToNetworkFolder();
+
+            if (connected)
+            {
+                logger.Info($"Connessione riuscita. Avvio monitoring della cartella: {configuration.PathToMonitor}");
+                StartActivityMonitoring(configuration.PathToMonitor);
+
+                // Stoppa il timer: non serve più riprovare
+                scmMachineScanTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+            }
+            else
+            {
+                logger.Warn($"Connessione fallita. Riprovo tra {configuration.MintutesRetry} minuti... (cartella: {configuration.PathToMonitor})");
+
+                // Se il watcher era attivo ma la connessione è caduta, lo disabilita
+                if (watchFolder != null)
+                {
+                    watchFolder.EnableRaisingEvents = false;
+                    watchFolder.Dispose();
+                    watchFolder = null;
+                }
+            }
+        }
+
+        private bool ConnectToNetworkFolder()
+        {
+            try
+            {
+                // Verifica se il path è una risorsa di rete (inizia con \\)
+                if (configuration.PathToMonitor.StartsWith(@"\\"))
+                {
+                    // Assumo che la configurazione contenga username e password
+                    // Puoi modificare questi campi in base alla tua classe ExampleConnectorConfiguration
+                    string username = "scm"; // Aggiungi questa proprietà alla configurazione
+                    string password = "scm"; // Aggiungi questa proprietà alla configurazione
+                    string domain = ".";     // Opzionale: aggiungi questa proprietà  
+
+                    // Crea le credenziali
+                    NetworkCredential credentials;
+                    credentials = new NetworkCredential(username, password, domain);
+
+                    // Estrae il percorso di rete (es: \\server\share)
+                    string networkPath = ExtractNetworkPath(configuration.PathToMonitor);
+
+                    logger.Info($"Connessione alla risorsa di rete: {networkPath}");
+
+                    // Stabilisce la connessione
+                    networkConnection = new NetworkConnection(networkPath, credentials);
+
+                    logger.Info("Connessione alla risorsa di rete stabilita con successo.");
+                }
+                else
+                {
+                    logger.Info("Il percorso monitorato è locale, nessuna autenticazione di rete necessaria.");
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"Errore durante la connessione alla risorsa di rete: {ex.Message}", ex);
+                networkConnection = null;
+                return false;
+            }
+        }
+
+        private string ExtractNetworkPath(string fullPath)
+        {
+            // Estrae il percorso di rete base (es: da \\server\share\folder\subfolder a \\server\share)
+            if (!fullPath.StartsWith(@"\\"))
+                return fullPath;
+
+            string[] parts = fullPath.TrimStart('\\').Split('\\');
+            if (parts.Length >= 2)
+            {
+                return $@"\\{parts[0]}\{parts[1]}";
+            }
+
+            return fullPath;
+        }
+
+
+
 
         /*
          * InternalSendMessage will be invoked once for each message to sent as output message.
@@ -141,6 +265,7 @@ namespace ReadXmlConnector
 
         private void StartActivityMonitoring(string pathToMonitor)
         {
+
             watchFolder = new FileSystemWatcher(pathToMonitor, "*.*");
 
             // Hook the triggers(events) to our handler (eventRaised)
@@ -160,125 +285,256 @@ namespace ReadXmlConnector
             }
         }
 
-        private async void EventRaised(object sender, System.IO.FileSystemEventArgs e)
+        // Metodo helper per caricare XML con retry logic
+        private async Task<XDocument> LoadXmlWithRetry(string xmlFilePath, int maxRetries = 3, int delayMs = 1000)
         {
-            logger.Info("Started monitoring folder ");
-
-            string xmlFilePath = e.FullPath;
-
-            XDocument xmlDoc = XDocument.Load(xmlFilePath);
-
-            // Recupero i dati dalla General Statistic
-
-            var general = xmlDoc
-                .Root
-                .Element("GeneralStatistics")
-                .Element("GeneralStatistic");
-
-            // Converte gli attributi in decimal
-            decimal area = ParseDecimal((string)general.Attribute("Area"));
-            decimal partsPerc = ParseDecimal((string)general.Attribute("PartsPerc"));
-            decimal scrapPerc = ParseDecimal((string)general.Attribute("ScrapPerc"));
-            decimal remnantPerc = ParseDecimal((string)general.Attribute("RemnantPerc"));
-
-            List<string> distinctOrders = new List<string>();
-
-            // --- 1. Recupero tutti i pattern ---
-            var patterns = xmlDoc.Root?.Element("Patterns")?.Elements("Pattern").ToList();
-
-            if (patterns == null || patterns.Count == 0)
+            for (int i = 0; i < maxRetries; i++)
             {
-                logger.Debug("Nessun pattern trovato nel file XML");
-                return;
+                try
+                {
+                    return XDocument.Load(xmlFilePath);
+                }
+                catch (IOException ex) when (i < maxRetries - 1)
+                {
+                    logger.Warn($"File {xmlFilePath} temporaneamente bloccato. Tentativo {i + 1}/{maxRetries}. Errore: {ex.Message}");
+                    await Task.Delay(delayMs);
+                }
+                catch (UnauthorizedAccessException ex) when (i < maxRetries - 1)
+                {
+                    logger.Warn($"Accesso negato al file {xmlFilePath}. Tentativo {i + 1}/{maxRetries}. Errore: {ex.Message}");
+                    await Task.Delay(delayMs);
+                }
             }
 
-            logger.Debug($"Trovati {patterns.Count} pattern.");
-
-            var product = "NeConnector";
-            var instance = "DEFAULT";
-
-            var cs = ConfigurationFactory.Create(product, instance);
-            var databaseMOM = cs.GetPropertyByUniqueName<Database>("supplychain.core.nicimdatabase.config+NicimDatabase", instance);
+            // Ultimo tentativo senza catch - se fallisce, l'eccezione viene propagata
+            return XDocument.Load(xmlFilePath);
+        }
 
 
-            foreach (var pattern in patterns)
+        private void DebugFileAccess(string filePath)
+        {
+            try
             {
-                string name = pattern.Attribute("Name")?.Value ?? "";
+                logger.Debug($"=== DEBUG FILE ACCESS per {filePath} ===");
 
-                // Ciclo su tutte le Part dentro questo Pattern
-                var patternParts = pattern.Element("Parts")?.Elements("Part");
+                // Verifica esistenza
+                logger.Debug($"File esiste: {File.Exists(filePath)}");
 
-                if (patternParts != null)
+                // Verifica attributi
+                if (File.Exists(filePath))
                 {
-                    foreach (var part in patternParts)
+                    FileAttributes attrs = File.GetAttributes(filePath);
+                    logger.Debug($"Attributi: {attrs}");
+
+                    FileInfo fi = new FileInfo(filePath);
+                    logger.Debug($"Dimensione: {fi.Length} bytes");
+                    logger.Debug($"Creato: {fi.CreationTime}");
+                    logger.Debug($"IsReadOnly: {fi.IsReadOnly}");
+                }
+
+                // Verifica identità corrente
+                logger.Debug($"Utente corrente: {System.Security.Principal.WindowsIdentity.GetCurrent().Name}");
+
+                // ===== RETRY OPEN READ =====
+                const int maxAttempts = 3;
+                int attempt = 0;
+                bool success = false;
+
+                while (attempt < maxAttempts && !success)
+                {
+                    attempt++;
+
+                    try
                     {
-                        string serial = part.Attribute("Code")?.Value ?? "";
-
-                        logger.Debug($"Seriale {serial} trovato.");
-
-                        bool res = await AddAssociation(configuration.ConnectionString, serial, name);
-
-                        List<string> Orders = await RetrieveOrders(configuration.ConnectionString, serial);
-
-                        // 3️⃣ Aggiungi alla lista globale solo i valori distinti
-                        foreach (var wo in Orders)
+                        using (FileStream fs = File.OpenRead(filePath))
                         {
-                            if (!distinctOrders.Contains(wo))
-                                distinctOrders.Add(wo);
+                            logger.Debug($"Permesso di lettura: OK (tentativo {attempt})");
+                            success = true;
                         }
+                    }
+                    catch (IOException ioEx)
+                    {
+                        logger.Warn($"Tentativo {attempt} fallito: file in uso. {ioEx.Message}");
 
+                        if (attempt >= maxAttempts)
+                            throw;
+
+                        Thread.Sleep(1000); // 1 secondo di attesa prima di riprovare
                     }
                 }
 
-            }
-
-
-            if (distinctOrders.Count == 0)
-            {
-                logger.Debug($"Nessun ordine trovato per i seriali processati");
-            }
-            else
-            {
-                // --- 3. Calcoli ---
-                decimal areaPerOrder = area / distinctOrders.Count;
-                decimal partsArea = areaPerOrder * (partsPerc / 100);
-                decimal scrapArea = areaPerOrder * (scrapPerc / 100);
-                decimal remnantArea = areaPerOrder * (remnantPerc / 100);
-                decimal quantity = partsArea + scrapArea + remnantArea;
-
-                logger.Debug($"Ordini trovati: {distinctOrders.Count}, area per ordine={areaPerOrder}");
-                logger.Debug($"PartsArea={partsArea}, ScrapArea={scrapArea}, RemnantArea={remnantArea}");
-
-                // --- 4. Aggiorna la tabella movimenti ---
-                await UpdateDatabaseOperations(configuration.ConnectionString, distinctOrders, quantity, scrapArea, remnantArea);
-
-            }
-
-            try
-            {
-                string outputFolder = configuration.OutputPath;
-                System.IO.Directory.CreateDirectory(outputFolder); // si assicura che la cartella esista
-
-                string destinationFilePath = Path.Combine(outputFolder, Path.GetFileName(xmlFilePath));
-
-                // Se il file esiste già nella cartella di destinazione, aggiunge un timestamp per evitare conflitti
-                if (File.Exists(destinationFilePath))
-                {
-                    string fileNameWithoutExt = Path.GetFileNameWithoutExtension(xmlFilePath);
-                    string ext = Path.GetExtension(xmlFilePath);
-                    string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                    destinationFilePath = Path.Combine(outputFolder, $"{fileNameWithoutExt}_{timestamp}{ext}");
-                }
-
-                File.Move(xmlFilePath, destinationFilePath);
-                logger.Debug($"File spostato in: {destinationFilePath}");
+                logger.Debug("=== FINE DEBUG ===");
             }
             catch (Exception ex)
             {
-                logger.Error($"Errore durante lo spostamento del file: {ex.Message}");
+                logger.Error($"Debug failed: {ex.Message}", ex);
             }
-            
-             logger.Debug("\nElaborazione completata con successo!");
+        }
+
+        public class OrderItem
+        {
+            public string Order { get; set; }
+            public decimal Quantity { get; set; }
+        }
+
+        private async void EventRaised(object sender, System.IO.FileSystemEventArgs e)
+        {
+
+            try
+            {
+
+                logger.Info("Started monitoring folder ");
+
+                string xmlFilePath = e.FullPath;
+
+                // DEBUG: verifica permessi
+                DebugFileAccess(xmlFilePath);
+
+                XDocument xmlDoc = null;
+
+                try
+                {
+                    // Carica il file XML con retry logic per gestire file locking
+                    xmlDoc = await LoadXmlWithRetry(xmlFilePath);
+                }
+                catch (Exception ex)
+                {
+                    logger.Error($"Errore durante il caricamento del file {xmlFilePath}: {ex.Message}", ex);
+                    return;
+                }
+
+                //XDocument xmlDoc = XDocument.Load(xmlFilePath);
+
+                // Recupero i dati dalla General Statistic
+
+                var general = xmlDoc
+                    .Root
+                    .Element("GeneralStatistics")
+                    .Element("GeneralStatistic");
+
+                // Converte gli attributi in decimal
+                //decimal area = ParseDecimal((string)general.Attribute("Area"));
+                //decimal partsPerc = ParseDecimal((string)general.Attribute("PartsPerc"));
+                //decimal scrapPerc = ParseDecimal((string)general.Attribute("ScrapPerc"));
+                //decimal remnantPerc = ParseDecimal((string)general.Attribute("RemnantPerc"));
+
+                //List<string> distinctOrders = new List<string>();
+
+                // --- 1. Recupero tutti i pattern ---
+                var patterns = xmlDoc.Root?.Element("Patterns")?.Elements("Pattern").ToList();
+
+                if (patterns == null || patterns.Count == 0)
+                {
+                    logger.Debug("Nessun pattern trovato nel file XML");
+                    return;
+                }
+
+                logger.Debug($"Trovati {patterns.Count} pattern.");
+
+                var product = "NeConnector";
+                var instance = "DEFAULT";
+
+                var cs = ConfigurationFactory.Create(product, instance);
+                var databaseMOM = cs.GetPropertyByUniqueName<Database>("supplychain.core.nicimdatabase.config+NicimDatabase", instance);
+
+
+                foreach (var pattern in patterns)
+                {
+                    string name = pattern.Attribute("Name")?.Value ?? "";
+                    string materialcode = pattern.Attribute("MaterialCode")?.Value ?? "";
+                    string sheetcode = pattern.Attribute("SheetCode")?.Value ?? "";
+                    decimal area = ParseDecimal((string)pattern.Attribute("Area"));
+                    decimal partsPerc = ParseDecimal((string)pattern.Attribute("PartsPerc"));
+                    decimal scrapPerc = ParseDecimal((string)pattern.Attribute("ScrapPerc"));
+                    decimal remnantPerc = ParseDecimal((string)pattern.Attribute("RemnantPerc"));
+                    decimal totalQuantity = 0;
+
+                    // Ciclo su tutte le Part dentro questo Pattern
+                    var patternParts = pattern.Element("Parts")?.Elements("Part");
+
+                    if (patternParts != null)
+                    {
+                        List<OrderItem> orderItems = new List<OrderItem>();
+
+                        foreach (var part in patternParts)
+                        {
+                            string serial = part.Attribute("Code")?.Value ?? "";
+                            decimal quantity = ParseDecimal((string)part.Attribute("Quantity"));
+
+                            totalQuantity += quantity;
+
+                            logger.Debug($"Seriale {serial} trovato.");
+
+                            bool res = await AddAssociation(configuration.ConnectionString, serial, name);
+
+                            List<string> Orders = await RetrieveOrders(configuration.ConnectionString, serial);
+
+                            foreach (var order in Orders)
+                            {
+                                orderItems.Add(new OrderItem
+                                {
+                                    Order = order,
+                                    Quantity = quantity
+                                });
+                            }
+
+                        }
+
+                        if (orderItems.Count == 0)
+                        {
+                            logger.Debug($"Nessun ordine trovato per i seriali processati");
+                        }
+                        else
+                        {
+                            // --- 3. Calcoli ---
+                            decimal areaPerOrder = area / totalQuantity;
+                            decimal partsArea = areaPerOrder * (partsPerc / 100);
+                            decimal scrapArea = areaPerOrder * (scrapPerc / 100);
+                            decimal remnantArea = areaPerOrder * (remnantPerc / 100);
+
+                            logger.Debug($"Ordini trovati: {orderItems.Count}, area per ordine={areaPerOrder}");
+                            logger.Debug($"PartsArea={partsArea}, ScrapArea={scrapArea}, RemnantArea={remnantArea}");
+
+                            // --- 4. Aggiorna la tabella movimenti ---
+                            await UpdateDatabaseOperations(configuration.ConnectionString, orderItems, partsArea, scrapArea, remnantArea, name, materialcode, sheetcode);
+
+                        }
+
+                    }
+
+                }
+
+                try
+                {
+                    string outputFolder = configuration.OutputPath;
+                    System.IO.Directory.CreateDirectory(outputFolder); // si assicura che la cartella esista
+
+                    string destinationFilePath = Path.Combine(outputFolder, Path.GetFileName(xmlFilePath));
+
+                    // Se il file esiste già nella cartella di destinazione, aggiunge un timestamp per evitare conflitti
+                    if (File.Exists(destinationFilePath))
+                    {
+                        string fileNameWithoutExt = Path.GetFileNameWithoutExtension(xmlFilePath);
+                        string ext = Path.GetExtension(xmlFilePath);
+                        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                        destinationFilePath = Path.Combine(outputFolder, $"{fileNameWithoutExt}_{timestamp}{ext}");
+                    }
+
+                    File.Move(xmlFilePath, destinationFilePath);
+                    logger.Debug($"File spostato in: {destinationFilePath}");
+                }
+                catch (Exception ex)
+                {
+                    logger.Error($"Errore durante lo spostamento del file: {ex.Message}");
+                }
+
+                logger.Debug("\nElaborazione completata con successo!");
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"Errore nel processamento del file");
+                return;
+            }
         }
 
         // --- FUNZIONI DI SUPPORTO ---
@@ -306,7 +562,7 @@ namespace ReadXmlConnector
 
                         getWOs.CommandType = CommandType.Text;
 
-                        logger.Debug($"Eseguo query WorkOrders per seruale: {serial}");
+                        logger.Debug($"Eseguo query WorkOrders per seriale: {serial}");
                         SqlDataReader reader = await getWOs.ExecuteReaderAsync();
 
                         while (reader.Read())
@@ -407,18 +663,19 @@ namespace ReadXmlConnector
 
 
 
-
-
-
         /**
          * Aggiorna la tabella movimenti con i valori calcolati
          */
-        static async Task UpdateDatabaseOperations(
+        static async Task 
+            UpdateDatabaseOperations(
             string connectionString,
-            List<string> workOrders,
+            List<OrderItem> workOrders,
             decimal partsArea,
             decimal scrapArea,
-            decimal remnantArea)
+            decimal remnantArea,
+            string name,
+            string material,
+            string sheetcode)
         {
             try
             {
@@ -426,20 +683,37 @@ namespace ReadXmlConnector
                 {
                     await connection.OpenAsync();
 
-                    string ordini = string.Join(",", workOrders.ConvertAll(wo => $"'{wo}'"));
-                    string commandText = QueryService.UpdateMovements.Replace("@orders", ordini);
+                    // Raggruppa gli ordini e conta le occorrenze
+                    var groupedOrders = workOrders
+                        .GroupBy(o => o.Order)
+                        .Select(g => new
+                        {
+                            Order = g.Key,
+                            TotalQuantity = g.Sum(x => x.Quantity)
+                        });
 
-                    using (SqlCommand updateMovimenti = new SqlCommand(commandText, connection))
+                    string commandText = QueryService.InsertConsumption;
+
+
+                    foreach (var order in groupedOrders)
                     {
-                        updateMovimenti.CommandType = CommandType.Text;
+                        using (SqlCommand cmd = new SqlCommand(commandText, connection))
+                        {
+                            cmd.CommandType = CommandType.Text;
 
-                        updateMovimenti.Parameters.Add("quantity", SqlDbType.Decimal).Value = partsArea;
-                        updateMovimenti.Parameters.Add("scrapPerc", SqlDbType.Decimal).Value = scrapArea;
-                        updateMovimenti.Parameters.Add("remnantPerc", SqlDbType.Decimal).Value = remnantArea;
+                            cmd.Parameters.Add("@order", SqlDbType.VarChar).Value = order.Order;
+                            cmd.Parameters.Add("@material", SqlDbType.VarChar).Value = material;
+                            cmd.Parameters.Add("@remnantcode", SqlDbType.VarChar).Value = sheetcode != material ? sheetcode : material;
+                            cmd.Parameters.Add("@good", SqlDbType.Decimal).Value = partsArea * order.TotalQuantity;
+                            cmd.Parameters.Add("@scrap", SqlDbType.Decimal).Value = scrapArea * order.TotalQuantity;
+                            cmd.Parameters.Add("@remnant", SqlDbType.Decimal).Value = remnantArea * order.TotalQuantity;
+                            cmd.Parameters.Add("@prgName", SqlDbType.VarChar).Value = name;
 
-                        int rowsAffected = await updateMovimenti.ExecuteNonQueryAsync();
-                        logger.Debug($"Aggiornati {rowsAffected} record nella tabella movimenti per gli ordini: {ordini}");
+                            await cmd.ExecuteNonQueryAsync();
+                        }
                     }
+
+                    logger.Debug($"Inseriti {groupedOrders.Count()} record nella tabella SCM_CONSUMPTION");
 
                 }
 

@@ -27,5 +27,8 @@ namespace ReadXmlConnector
 
         [Property("Output Path", "Folder in which file is moved after the process")]
         public string OutputPath { get; set; }
+
+        [Property("Retry Minutes", "Number of minutes after which retry connession")]
+        public int MintutesRetry { get; set; }
     }
 }
