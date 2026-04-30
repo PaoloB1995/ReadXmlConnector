@@ -15,7 +15,7 @@ namespace ReadXmlConnector.Services
 
         public static string UpdateAssociation = "UPDATE SCM_PROJECT_COMPONENT SET PROJECT_ID = @project WHERE COMPONENT_SERIAL_NUMBER = @serial";
 
-        public static string CheckAssociation = "select top(1) COMPONENT_SERIAL_NUMBER from SCM_PROJECT_COMPONENT where COMPONENT_SERIAL_NUMBER = @serial";
+        public static string CheckAssociation = "select top(1) COMPONENT_SERIAL_NUMBER from SCM_PROJECT_COMPONENT where COMPONENT_SERIAL_NUMBER = @serial and PROJECT_ID = @project";
 
     }
 }

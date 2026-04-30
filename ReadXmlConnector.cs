@@ -375,6 +375,7 @@ namespace ReadXmlConnector
         {
             public string Order { get; set; }
             public decimal Quantity { get; set; }
+            public decimal AreaGood { get; set; }
         }
 
         private async void EventRaised(object sender, System.IO.FileSystemEventArgs e)
@@ -443,8 +444,8 @@ namespace ReadXmlConnector
                     string name = pattern.Attribute("Name")?.Value ?? "";
                     string materialcode = pattern.Attribute("MaterialCode")?.Value ?? "";
                     string sheetcode = pattern.Attribute("SheetCode")?.Value ?? "";
-                    decimal area = ParseDecimal((string)pattern.Attribute("Area"));
-                    decimal partsPerc = ParseDecimal((string)pattern.Attribute("PartsPerc"));
+                    string valueArea = (string)pattern.Attribute("Area");
+                    decimal area = decimal.Parse(valueArea.Replace(',', '.'),CultureInfo.InvariantCulture);
                     decimal scrapPerc = ParseDecimal((string)pattern.Attribute("ScrapPerc"));
                     decimal remnantPerc = ParseDecimal((string)pattern.Attribute("RemnantPerc"));
                     decimal totalQuantity = 0;
@@ -460,22 +461,29 @@ namespace ReadXmlConnector
                         {
                             string serial = part.Attribute("Code")?.Value ?? "";
                             decimal quantity = ParseDecimal((string)part.Attribute("Quantity"));
+                            decimal length = ParseDecimal((string)part.Attribute("Length"))/1000;
+                            decimal width = ParseDecimal((string)part.Attribute("Width"))/1000;
+                            decimal areaGood = quantity * length * width;
 
-                            totalQuantity += quantity;
-
-                            logger.Debug($"Seriale {serial} trovato.");
-
-                            bool res = await AddAssociation(configuration.ConnectionString, serial, name);
-
-                            List<string> Orders = await RetrieveOrders(configuration.ConnectionString, serial);
-
-                            foreach (var order in Orders)
+                            if (!serial.StartsWith("R_"))
                             {
-                                orderItems.Add(new OrderItem
+                                logger.Debug($"Seriale {serial} trovato.");
+
+                                bool res = await AddAssociation(configuration.ConnectionString, serial, name);
+
+                                totalQuantity += quantity;
+
+                                List<string> Orders = await RetrieveOrders(configuration.ConnectionString, serial);
+
+                                foreach (var order in Orders)
                                 {
-                                    Order = order,
-                                    Quantity = quantity
-                                });
+                                    orderItems.Add(new OrderItem
+                                    {
+                                        Order = order,
+                                        Quantity = quantity,
+                                        AreaGood = areaGood
+                                    });
+                                }
                             }
 
                         }
@@ -488,15 +496,14 @@ namespace ReadXmlConnector
                         {
                             // --- 3. Calcoli ---
                             decimal areaPerOrder = area / totalQuantity;
-                            decimal partsArea = areaPerOrder * (partsPerc / 100);
                             decimal scrapArea = areaPerOrder * (scrapPerc / 100);
                             decimal remnantArea = areaPerOrder * (remnantPerc / 100);
 
                             logger.Debug($"Ordini trovati: {orderItems.Count}, area per ordine={areaPerOrder}");
-                            logger.Debug($"PartsArea={partsArea}, ScrapArea={scrapArea}, RemnantArea={remnantArea}");
+                            logger.Debug($"ScrapArea={scrapArea}, RemnantArea={remnantArea}");
 
                             // --- 4. Aggiorna la tabella movimenti ---
-                            await UpdateDatabaseOperations(configuration.ConnectionString, orderItems, partsArea, scrapArea, remnantArea, name, materialcode, sheetcode);
+                            await UpdateDatabaseOperations(configuration.ConnectionString, orderItems, scrapArea, remnantArea, name, materialcode, sheetcode);
 
                         }
 
@@ -600,8 +607,9 @@ namespace ReadXmlConnector
 
                         // Aggiungi il parametro @serial
                         checkAssociation.Parameters.Add("@serial", SqlDbType.VarChar).Value = serial;
-
-                        // Esegui la query (di solito ExecuteScalar va benissimo)
+                        checkAssociation.Parameters.Add("@project", SqlDbType.VarChar).Value = prjName;
+                        
+                        // Esegui la query 
                         object queryResult = await checkAssociation.ExecuteScalarAsync();
 
                         if (queryResult == null || queryResult == DBNull.Value)
@@ -609,7 +617,7 @@ namespace ReadXmlConnector
                             // ------------------------------------------------------
                             // 2️⃣ NON ESISTE → esegui INSERT
                             // ------------------------------------------------------
-                            logger.Debug($"Nessun record per {serial}. Eseguo INSERT...");
+                            logger.Debug($"Nessun record per seriale {serial} e project {prjName}. Eseguo INSERT...");
 
                             using (SqlCommand insertCmd = new SqlCommand(QueryService.InsertAssociation, connection))
                             {
@@ -621,9 +629,9 @@ namespace ReadXmlConnector
                                 int insertResult = await insertCmd.ExecuteNonQueryAsync();
 
                                 if (insertResult > 0)
-                                    result.Add($"INSERTED: {serial}");
+                                    result.Add($"INSERTED: {serial}, {prjName}");
                                 else
-                                    result.Add($"INSERT_FAILED: {serial}");
+                                    result.Add($"INSERT_FAILED: {serial}, {prjName}");
                             }
 
                             return true;
@@ -633,22 +641,8 @@ namespace ReadXmlConnector
                             // ------------------------------------------------------
                             // 3️⃣ ESISTE → esegui UPDATE
                             // ------------------------------------------------------
-                            logger.Debug($"Record già esistente per {serial}. Eseguo UPDATE...");
+                            logger.Debug($"Record già esistente per {serial} e project {prjName}. Nessun nuovo inserimento in tabella...");
 
-                            using (SqlCommand updateCmd = new SqlCommand(QueryService.UpdateAssociation, connection))
-                            {
-                                updateCmd.CommandType = CommandType.Text;
-
-                                updateCmd.Parameters.Add("@project", SqlDbType.VarChar).Value = prjName;
-                                updateCmd.Parameters.Add("@serial", SqlDbType.VarChar).Value = serial;
-
-                                int updateResult = await updateCmd.ExecuteNonQueryAsync();
-
-                                if (updateResult > 0)
-                                    result.Add($"UPDATED: {serial}");
-                                else
-                                    result.Add($"UPDATE_FAILED: {serial}");
-                            }
                             return false;
                         }
                     }
@@ -670,7 +664,6 @@ namespace ReadXmlConnector
             UpdateDatabaseOperations(
             string connectionString,
             List<OrderItem> workOrders,
-            decimal partsArea,
             decimal scrapArea,
             decimal remnantArea,
             string name,
@@ -689,7 +682,8 @@ namespace ReadXmlConnector
                         .Select(g => new
                         {
                             Order = g.Key,
-                            TotalQuantity = g.Sum(x => x.Quantity)
+                            TotalQuantity = g.Sum(x => x.Quantity),
+                            TotalAreaGood = g.Sum(x => x.AreaGood)
                         });
 
                     string commandText = QueryService.InsertConsumption;
@@ -704,7 +698,7 @@ namespace ReadXmlConnector
                             cmd.Parameters.Add("@order", SqlDbType.VarChar).Value = order.Order;
                             cmd.Parameters.Add("@material", SqlDbType.VarChar).Value = material;
                             cmd.Parameters.Add("@remnantcode", SqlDbType.VarChar).Value = sheetcode != material ? sheetcode : material;
-                            cmd.Parameters.Add("@good", SqlDbType.Decimal).Value = partsArea * order.TotalQuantity;
+                            cmd.Parameters.Add("@good", SqlDbType.Decimal).Value = order.TotalAreaGood;
                             cmd.Parameters.Add("@scrap", SqlDbType.Decimal).Value = scrapArea * order.TotalQuantity;
                             cmd.Parameters.Add("@remnant", SqlDbType.Decimal).Value = remnantArea * order.TotalQuantity;
                             cmd.Parameters.Add("@prgName", SqlDbType.VarChar).Value = name;
