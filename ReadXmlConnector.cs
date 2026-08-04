@@ -265,17 +265,12 @@ namespace ReadXmlConnector
 
         private void StartActivityMonitoring(string pathToMonitor)
         {
-
-            watchFolder = new FileSystemWatcher(pathToMonitor, "*.xml");
-
-            // Hook the triggers(events) to our handler (eventRaised)
-            //watchFolder.Error += new ErrorEventHandler(watchFolder_Error);
-            watchFolder.Created += new FileSystemEventHandler(EventRaised);
-            watchFolder.Renamed += new RenamedEventHandler(EventRaised);
-
             //Enable monitoring
             try
             {
+                watchFolder = new FileSystemWatcher(pathToMonitor, "*.xml");
+                watchFolder.Created += new FileSystemEventHandler(EventRaised);
+                watchFolder.Renamed += new RenamedEventHandler(EventRaised);
                 watchFolder.EnableRaisingEvents = true;
                 logger.Info("Started monitoring folder " + pathToMonitor);
             }
